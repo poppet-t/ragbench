@@ -1,6 +1,6 @@
-# RAGBench (SQLite vs Milvus vs PageIndex-style)
+# RAGBench (SQLite vs Milvus vs PageIndex-style vs MemOS)
 
-Offline-friendly benchmark comparing multiple retrieval/indexing approaches on three PDFs.
+Offline-friendly benchmark comparing multiple retrieval/indexing approaches (including MemOS) on three PDFs.
 Run commands from the repo root. If you see `No module named scripts`, prefix with `PYTHONPATH=.`.
 
 ## Quickstart (mock LLM + hash embeddings)
