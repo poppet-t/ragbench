@@ -178,6 +178,10 @@ python -m scripts.run_eval \
   --qa data/qa_seed.jsonl \
   --out-dir out
 ```
+Tips:
+- Use a fresh `--memos-user-id` and `--memos-cube-id` per run to avoid mixing old memory formats.
+- When switching configs or after code changes, add `--force-reindex`.
+- Sanity check the service first: `curl http://localhost:8000/docs`.
 
 ## Data/QA
 - Seed QA: `data/qa_seed.jsonl` (provided).

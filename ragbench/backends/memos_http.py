@@ -46,8 +46,9 @@ class MemOSHTTPStore(VectorStore):
             payload = {
                 "user_id": self.user_id,
                 "mem_cube_id": self.mem_cube_id,
-                "messages": [{"role": "user", "content": json.dumps(blob, ensure_ascii=True)}],
+                "memory_content": json.dumps(blob, ensure_ascii=True),
                 "async_mode": self.async_mode,
+                "source": "ragbench",
             }
             self._post("/product/add", payload)
             self.add_calls += 1
@@ -61,6 +62,7 @@ class MemOSHTTPStore(VectorStore):
             "query": query_text,
             "user_id": self.user_id,
             "mem_cube_id": self.mem_cube_id,
+            "top_k": top_k,
         }
         data = self._post("/product/search", payload)
         self.search_calls += 1
@@ -80,7 +82,30 @@ def _extract_candidates(data: Any) -> List[Dict[str, Any]]:
         return [c for c in data if isinstance(c, dict)]
     if not isinstance(data, dict):
         return []
-    for key in ["results", "data", "items", "memories"]:
+    if isinstance(data.get("data"), dict):
+        data = data["data"]
+    candidates: List[Dict[str, Any]] = []
+    for key in ["text_mem", "pref_mem", "act_mem", "para_mem"]:
+        groups = data.get(key)
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            memories = group.get("memories")
+            if not isinstance(memories, list):
+                continue
+            for mem in memories:
+                if isinstance(mem, dict):
+                    cand = mem.copy()
+                    if "cube_id" not in cand and group.get("cube_id"):
+                        cand["cube_id"] = group.get("cube_id")
+                    candidates.append(cand)
+                elif mem is not None:
+                    candidates.append({"memory": mem, "cube_id": group.get("cube_id")})
+    if candidates:
+        return candidates
+    for key in ["results", "items", "memories"]:
         val = data.get(key)
         if isinstance(val, list):
             return [c for c in val if isinstance(c, dict)]
@@ -88,28 +113,23 @@ def _extract_candidates(data: Any) -> List[Dict[str, Any]]:
 
 
 def _candidate_to_chunk(cand: Dict[str, Any]) -> Dict[str, Any] | None:
-    content = None
-    if "content" in cand:
-        content = cand.get("content")
-    elif "message" in cand:
-        msg = cand.get("message") or {}
-        content = msg.get("content") if isinstance(msg, dict) else msg
-    elif "messages" in cand and cand.get("messages"):
-        msg = cand.get("messages")[-1]
-        if isinstance(msg, dict):
-            content = msg.get("content")
-        else:
-            content = msg
+    content = _extract_content(cand)
     if content is None:
         return None
-
-    text_content = content if isinstance(content, str) else json.dumps(content)
+    text_content = content if isinstance(content, str) else json.dumps(content, ensure_ascii=True)
     try:
         blob = json.loads(text_content)
     except json.JSONDecodeError:
         blob = {"text": text_content}
 
+    meta = cand.get("metadata") if isinstance(cand.get("metadata"), dict) else {}
+    info = meta.get("info") if isinstance(meta.get("info"), dict) else {}
+
     score = cand.get("score")
+    if score is None and meta:
+        score = meta.get("relativity")
+    if score is None and meta:
+        score = meta.get("score")
     if score is None and "distance" in cand:
         try:
             score = -float(cand["distance"])
@@ -119,12 +139,46 @@ def _candidate_to_chunk(cand: Dict[str, Any]) -> Dict[str, Any] | None:
         score = 0.0
 
     return {
-        "chunk_id": blob.get("chunk_id") or cand.get("chunk_id"),
-        "doc_id": blob.get("doc_id") or cand.get("doc_id"),
-        "pdf_filename": blob.get("pdf_filename") or cand.get("pdf_filename"),
-        "page_start": blob.get("page_start") or cand.get("page_start") or 0,
-        "page_end": blob.get("page_end") or cand.get("page_end") or 0,
-        "text": blob.get("text", ""),
+        "chunk_id": _pick_value("chunk_id", blob, info, cand, meta),
+        "doc_id": _pick_value("doc_id", blob, info, cand, meta),
+        "pdf_filename": _pick_value("pdf_filename", blob, info, cand, meta),
+        "page_start": _as_int(_pick_value("page_start", blob, info, cand, meta), 0),
+        "page_end": _as_int(_pick_value("page_end", blob, info, cand, meta), 0),
+        "text": _pick_value("text", blob, info, cand, meta) or text_content,
         "meta": blob.get("meta") or {},
         "score": float(score),
     }
+
+
+def _extract_content(cand: Dict[str, Any]) -> Any:
+    if "memory" in cand:
+        return cand.get("memory")
+    if "content" in cand:
+        return cand.get("content")
+    if "metadata" in cand and isinstance(cand.get("metadata"), dict):
+        meta = cand["metadata"]
+        if "memory" in meta:
+            return meta.get("memory")
+        if "content" in meta:
+            return meta.get("content")
+    if "message" in cand:
+        msg = cand.get("message") or {}
+        return msg.get("content") if isinstance(msg, dict) else msg
+    if "messages" in cand and cand.get("messages"):
+        msg = cand.get("messages")[-1]
+        return msg.get("content") if isinstance(msg, dict) else msg
+    return None
+
+
+def _pick_value(key: str, *sources: Dict[str, Any]) -> Any:
+    for src in sources:
+        if isinstance(src, dict) and key in src and src.get(key) not in (None, ""):
+            return src.get(key)
+    return None
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
