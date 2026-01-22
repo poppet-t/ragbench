@@ -47,6 +47,9 @@ def build_backend(
             user_id=memos_user_id,
             mem_cube_id=memos_cube_id,
             async_mode=memos_async_mode,
+            add_mode="fast",
+            search_mode="fast",
+            search_memory_type="All",
         )
     if name == "pageindex_sqlite":
         return SQLiteVectorStore(path=os.path.join(out_dir, "pageindex_sqlite.db"))

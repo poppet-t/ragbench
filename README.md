@@ -164,14 +164,45 @@ python -m scripts.run_eval \
 - Start with Docker Compose: `docker compose -f docker/docker-compose.milvus.yml up -d`
 - Use `--backend milvus_rag` or `--backend pageindex_milvus`.
 
-## MemOS backend
-If you have a MemOS HTTP service running:
+## MemOS backend (working config)
+MemOS must be reachable at `http://localhost:8000` and configured for the `general_text` backend.
+The following MemOS `.env` settings are required for a stable setup:
+- `MOS_TEXT_MEM_TYPE=general_text`
+- `NEO4J_BACKEND=neo4j-community`
+- `REDIS_HOST=redis` and `MEMSCHEDULER_REDIS_HOST=redis`
+- `VEC_COT_CALL=false` and `BM25_CALL=false`
+- Set a real embedder backend/model (example: `MOS_EMBEDDER_BACKEND=ollama`, `MOS_EMBEDDER_MODEL=nomic-embed-text`, `EMBEDDING_DIMENSION=768`)
+
+Smoke test the MemOS API before running the benchmark:
+```
+curl -s http://localhost:8000/product/add \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id":"ragbench_smoke",
+    "writable_cube_ids":["ragbench_smoke"],
+    "messages":[{"role":"user","content":"hello world"}],
+    "async_mode":"sync",
+    "mode":"fast"
+  }'
+
+curl -s http://localhost:8000/product/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id":"ragbench_smoke",
+    "readable_cube_ids":["ragbench_smoke"],
+    "query":"hello",
+    "top_k":3,
+    "mode":"fast"
+  }'
+```
+
+Run the MemOS backend from ragbench:
 ```
 python -m scripts.run_eval \
   --backend memos_rag \
   --memos-url http://localhost:8000 \
-  --memos-user-id default \
-  --memos-cube-id default \
+  --memos-user-id ragbench_eval_memos \
+  --memos-cube-id ragbench_eval_memos \
   --memos-async-mode sync \
   --pdfs /mnt/data/zCloak_AI_Whitepaper_v1.4.pdf /mnt/data/zhang_uafx\\ \\(1\\).pdf /mnt/data/NVIDIAAn.pdf \
   --doc-ids whitepaper paper earnings \
@@ -181,7 +212,7 @@ python -m scripts.run_eval \
 Tips:
 - Use a fresh `--memos-user-id` and `--memos-cube-id` per run to avoid mixing old memory formats.
 - When switching configs or after code changes, add `--force-reindex`.
-- Sanity check the service first: `curl http://localhost:8000/docs`.
+- Ragbench uses MemOS `mode=fast` for add/search; tweak `ragbench/backends/memos_http.py` if you need another mode.
 
 ## Data/QA
 - Seed QA: `data/qa_seed.jsonl` (provided).

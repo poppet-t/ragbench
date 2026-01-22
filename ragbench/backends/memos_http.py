@@ -14,13 +14,41 @@ class MemOSHTTPStore(VectorStore):
         user_id: str = "default",
         mem_cube_id: str = "default",
         async_mode: str = "sync",
-        timeout_s: int = 60,
+        timeout_s: int = 180,
+        mode: str = "fast",
+        add_mode: str | None = None,
+        search_mode: str | None = None,
+        search_memory_type: str | None = "All",
+        dedup: str | None = "sim",
+        search_top_k_multiplier: int = 3,
+        search_top_k_floor: int = 0,
+        fallback_search_mode: str | None = "fast",
+        fallback_search_memory_type: str | None = "All",
+        include_preference: bool = False,
+        pref_top_k: int = 0,
+        search_tool_memory: bool = False,
+        tool_mem_top_k: int = 0,
+        session_id: str = "default_session",
     ):
         self.base_url = base_url.rstrip("/")
         self.user_id = user_id
         self.mem_cube_id = mem_cube_id
         self.async_mode = async_mode
         self.timeout_s = timeout_s
+        self.mode = mode
+        self.add_mode = add_mode or mode
+        self.search_mode = search_mode or mode
+        self.search_memory_type = search_memory_type
+        self.dedup = dedup
+        self.search_top_k_multiplier = max(1, search_top_k_multiplier)
+        self.search_top_k_floor = max(0, search_top_k_floor)
+        self.fallback_search_mode = fallback_search_mode
+        self.fallback_search_memory_type = fallback_search_memory_type
+        self.include_preference = include_preference
+        self.pref_top_k = max(0, pref_top_k)
+        self.search_tool_memory = search_tool_memory
+        self.tool_mem_top_k = max(0, tool_mem_top_k)
+        self.session_id = session_id
         self.add_calls = 0
         self.search_calls = 0
         self.index_time_ms = 0.0
@@ -31,24 +59,62 @@ class MemOSHTTPStore(VectorStore):
         resp.raise_for_status()
         return resp.json()
 
+    def _ensure_user(self) -> None:
+        payload = {
+            "user_id": self.user_id,
+            "user_name": self.user_id,
+            "mem_cube_id": self.mem_cube_id,
+        }
+        endpoints = [
+            "/product/users/register",
+            "/product/user/register",
+            "/product/register",
+            "/users/register",
+        ]
+        for endpoint in endpoints:
+            url = f"{self.base_url}{endpoint}"
+            try:
+                resp = requests.post(url, json=payload, timeout=self.timeout_s)
+            except requests.RequestException:
+                continue
+            if resp.status_code == 404:
+                continue
+            if resp.status_code == 200:
+                return
+            if resp.status_code in (400, 409, 500):
+                try:
+                    data = resp.json()
+                    msg = str(data.get("message", "")).lower()
+                except ValueError:
+                    msg = resp.text.lower()
+                if "exist" in msg or "already" in msg:
+                    return
+            resp.raise_for_status()
+
     def index(self, items: List[Dict[str, Any]]) -> None:
         start = time.perf_counter()
+        self._ensure_user()
         for item in items:
-            blob = {
+            meta_blob = {
                 "chunk_id": item.get("chunk_id"),
                 "doc_id": item.get("doc_id"),
                 "pdf_filename": item.get("pdf_filename"),
                 "page_start": item.get("page_start"),
                 "page_end": item.get("page_end"),
-                "text": item.get("text", ""),
-                "meta": item.get("meta") or {},
             }
+            memory_content = _format_memory(meta_blob, item.get("text", ""))
+            info_payload = dict(meta_blob)
+            info_payload["ragbench_meta_json"] = json.dumps(meta_blob, ensure_ascii=True)
             payload = {
                 "user_id": self.user_id,
                 "mem_cube_id": self.mem_cube_id,
-                "memory_content": json.dumps(blob, ensure_ascii=True),
+                "readable_cube_ids": [self.mem_cube_id],
+                "writable_cube_ids": [self.mem_cube_id],
+                "messages": [{"role": "user", "content": memory_content}],
                 "async_mode": self.async_mode,
-                "source": "ragbench",
+                "mode": self.add_mode,
+                "session_id": self.session_id,
+                "info": info_payload,
             }
             self._post("/product/add", payload)
             self.add_calls += 1
@@ -58,15 +124,45 @@ class MemOSHTTPStore(VectorStore):
         raise NotImplementedError("MemOSHTTPStore does not support vector search. Use search_text().")
 
     def search_text(self, query_text: str, top_k: int) -> List[Dict[str, Any]]:
+        request_top_k = max(
+            top_k,
+            top_k * self.search_top_k_multiplier,
+            self.search_top_k_floor,
+        )
         payload = {
             "query": query_text,
             "user_id": self.user_id,
             "mem_cube_id": self.mem_cube_id,
-            "top_k": top_k,
+            "readable_cube_ids": [self.mem_cube_id],
+            "mode": self.search_mode,
+            "top_k": request_top_k,
+            "include_preference": self.include_preference,
+            "pref_top_k": self.pref_top_k,
+            "search_tool_memory": self.search_tool_memory,
+            "tool_mem_top_k": self.tool_mem_top_k,
+            "session_id": self.session_id,
         }
-        data = self._post("/product/search", payload)
+        if self.search_memory_type:
+            payload["search_memory_type"] = self.search_memory_type
+        if self.dedup:
+            payload["dedup"] = self.dedup
+        data = None
+        candidates: List[Dict[str, Any]] = []
+        try:
+            data = self._post("/product/search", payload)
+            candidates = _extract_candidates(data)
+        except requests.RequestException:
+            data = None
+            candidates = []
+        if not candidates and self.fallback_search_mode and self.fallback_search_mode != self.search_mode:
+            payload["mode"] = self.fallback_search_mode
+            if self.fallback_search_memory_type is None:
+                payload.pop("search_memory_type", None)
+            else:
+                payload["search_memory_type"] = self.fallback_search_memory_type
+            data = self._post("/product/search", payload)
+            candidates = _extract_candidates(data)
         self.search_calls += 1
-        candidates = _extract_candidates(data)
         hits: List[Dict[str, Any]] = []
         for cand in candidates:
             hit = _candidate_to_chunk(cand)
@@ -85,7 +181,7 @@ def _extract_candidates(data: Any) -> List[Dict[str, Any]]:
     if isinstance(data.get("data"), dict):
         data = data["data"]
     candidates: List[Dict[str, Any]] = []
-    for key in ["text_mem", "pref_mem", "act_mem", "para_mem"]:
+    for key in ["text_mem", "pref_mem", "act_mem", "para_mem", "tool_mem"]:
         groups = data.get(key)
         if not isinstance(groups, list):
             continue
@@ -117,13 +213,24 @@ def _candidate_to_chunk(cand: Dict[str, Any]) -> Dict[str, Any] | None:
     if content is None:
         return None
     text_content = content if isinstance(content, str) else json.dumps(content, ensure_ascii=True)
-    try:
-        blob = json.loads(text_content)
-    except json.JSONDecodeError:
-        blob = {"text": text_content}
-
     meta = cand.get("metadata") if isinstance(cand.get("metadata"), dict) else {}
-    info = meta.get("info") if isinstance(meta.get("info"), dict) else {}
+    info = {}
+    if isinstance(cand.get("info"), dict):
+        info.update(cand["info"])
+    if isinstance(meta.get("info"), dict):
+        info.update(meta["info"])
+
+    blob = {}
+    if isinstance(info.get("ragbench_meta"), dict):
+        blob.update(info["ragbench_meta"])
+    meta_blob, body_text = _parse_memory_text(text_content)
+    if meta_blob:
+        blob.update(meta_blob)
+    if not blob:
+        try:
+            blob = json.loads(text_content)
+        except json.JSONDecodeError:
+            blob = {}
 
     score = cand.get("score")
     if score is None and meta:
@@ -144,7 +251,7 @@ def _candidate_to_chunk(cand: Dict[str, Any]) -> Dict[str, Any] | None:
         "pdf_filename": _pick_value("pdf_filename", blob, info, cand, meta),
         "page_start": _as_int(_pick_value("page_start", blob, info, cand, meta), 0),
         "page_end": _as_int(_pick_value("page_end", blob, info, cand, meta), 0),
-        "text": _pick_value("text", blob, info, cand, meta) or text_content,
+        "text": _pick_value("text", blob, info, cand, meta) or body_text or text_content,
         "meta": blob.get("meta") or {},
         "score": float(score),
     }
@@ -182,3 +289,26 @@ def _as_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _format_memory(meta_blob: Dict[str, Any], text: str) -> str:
+    meta_json = json.dumps(meta_blob, ensure_ascii=True)
+    return f"RAGBENCH_META={meta_json}\nRAGBENCH_TEXT={text}"
+
+
+def _parse_memory_text(text: str) -> tuple[Dict[str, Any], str]:
+    marker = "RAGBENCH_META="
+    start = text.find(marker)
+    if start != -1:
+        payload = text[start:]
+        meta_line, _, rest = payload.partition("\n")
+        meta_json = meta_line[len(marker):]
+        try:
+            meta_blob = json.loads(meta_json)
+        except json.JSONDecodeError:
+            meta_blob = {}
+        body_text = rest
+        if rest.startswith("RAGBENCH_TEXT="):
+            body_text = rest[len("RAGBENCH_TEXT="):]
+        return meta_blob, body_text
+    return {}, text
